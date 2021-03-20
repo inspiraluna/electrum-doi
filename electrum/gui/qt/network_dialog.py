@@ -117,7 +117,7 @@ class NodesListWidget(QTreeWidget):
         menu.exec_(self.viewport().mapToGlobal(position))
 
     def keyPressEvent(self, event):
-        if event.key() in [ Qt.Key_F2, Qt.Key_Return ]:
+        if event.key() in [ Qt.Key_F2, Qt.Key_Return, Qt.Key_Enter ]:
             self.on_activated(self.currentItem(), self.currentColumn())
         else:
             QTreeWidget.keyPressEvent(self, event)
@@ -148,7 +148,7 @@ class NodesListWidget(QTreeWidget):
                 x = connected_servers_item
             for i in interfaces:
                 star = ' *' if i == network.interface else ''
-                item = QTreeWidgetItem([f"{i.server.net_addr_str()}" + star, '%d'%i.tip])
+                item = QTreeWidgetItem([f"{i.server.to_friendly_name()}" + star, '%d'%i.tip])
                 item.setData(0, self.ITEMTYPE_ROLE, self.ItemType.CONNECTED_SERVER)
                 item.setData(0, self.SERVER_ADDR_ROLE, i.server)
                 item.setToolTip(0, str(i.server))
@@ -327,13 +327,13 @@ class NetworkChoiceLayout(object):
         server = net_params.server
         auto_connect = net_params.auto_connect
         if not self.server_e.hasFocus():
-            self.server_e.setText(server.net_addr_str())
+            self.server_e.setText(server.to_friendly_name())
         self.autoconnect_cb.setChecked(auto_connect)
 
         height_str = "%d "%(self.network.get_local_height()) + _('blocks')
         self.height_label.setText(height_str)
         n = len(self.network.get_interfaces())
-        status = _("Connected to {0} nodes.").format(n) if n else _("Not connected")
+        status = _("Connected to {0} nodes.").format(n) if n > 1 else _("Connected to {0} node.").format(n) if n == 1 else _("Not connected")
         self.status_label.setText(status)
         chains = self.network.get_blockchains()
         if len(chains) > 1:
@@ -464,13 +464,13 @@ class TorDetector(QThread):
     @staticmethod
     def is_tor_port(net_addr: Tuple[str, int]) -> bool:
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.1)
-            s.connect(net_addr)
-            # Tor responds uniquely to HTTP-like requests
-            s.send(b"GET\n")
-            if b"Tor is not an HTTP Proxy" in s.recv(1024):
-                return True
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.1)
+                s.connect(net_addr)
+                # Tor responds uniquely to HTTP-like requests
+                s.send(b"GET\n")
+                if b"Tor is not an HTTP Proxy" in s.recv(1024):
+                    return True
         except socket.error:
             pass
         return False

@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import QMenu, QVBoxLayout, QTreeWidget, QTreeWidgetItem, QH
 from electrum.i18n import _
 from electrum.util import format_time
 from electrum.invoices import Invoice, PR_UNPAID, PR_PAID, PR_INFLIGHT, PR_FAILED, PR_TYPE_ONCHAIN, PR_TYPE_LN
-from electrum.lnutil import PaymentAttemptLog
+from electrum.lnutil import HtlcLog
 
 from .util import MyTreeView, read_QIcon, MySortModel, pr_icons
 from .util import CloseButton, Buttons
@@ -98,19 +98,18 @@ class InvoiceList(MyTreeView):
         self.proxy.setDynamicSortFilter(False)  # temp. disable re-sorting after every change
         self.std_model.clear()
         self.update_headers(self.__class__.headers)
-        for idx, item in enumerate(self.parent.wallet.get_invoices()):
+        for idx, item in enumerate(self.parent.wallet.get_unpaid_invoices()):
+            key = self.parent.wallet.get_key_for_outgoing_invoice(item)
             if item.is_lightning():
-                key = item.rhash
                 icon_name = 'lightning.png'
             else:
-                key = item.id
                 icon_name = 'bitcoin.png'
                 if item.bip70:
                     icon_name = 'seal.png'
             status = self.parent.wallet.get_invoice_status(item)
             status_str = item.get_status_str(status)
             message = item.message
-            amount = item.amount
+            amount = item.get_amount_sat()
             timestamp = item.time or 0
             date_str = format_time(timestamp) if timestamp else _('Unknown')
             amount_str = self.parent.format_amount(amount, whitespaces=True)
@@ -142,7 +141,7 @@ class InvoiceList(MyTreeView):
             can_batch_pay = all([i.type == PR_TYPE_ONCHAIN and wallet.get_invoice_status(i) == PR_UNPAID for i in invoices])
             menu = QMenu(self)
             if can_batch_pay:
-                menu.addAction(_("Batch pay invoices"), lambda: self.parent.pay_multiple_invoices(invoices))
+                menu.addAction(_("Batch pay invoices") + "...", lambda: self.parent.pay_multiple_invoices(invoices))
             menu.addAction(_("Delete invoices"), lambda: self.parent.delete_invoices(keys))
             menu.exec_(self.viewport().mapToGlobal(position))
             return
@@ -163,7 +162,7 @@ class InvoiceList(MyTreeView):
             menu.addAction(_("Details"), lambda: self.parent.show_onchain_invoice(invoice))
         status = wallet.get_invoice_status(invoice)
         if status == PR_UNPAID:
-            menu.addAction(_("Pay"), lambda: self.parent.do_pay_invoice(invoice))
+            menu.addAction(_("Pay") + "...", lambda: self.parent.do_pay_invoice(invoice))
         if status == PR_FAILED:
             menu.addAction(_("Retry"), lambda: self.parent.do_pay_invoice(invoice))
         if self.parent.wallet.lnworker:
@@ -173,7 +172,7 @@ class InvoiceList(MyTreeView):
         menu.addAction(_("Delete"), lambda: self.parent.delete_invoices([key]))
         menu.exec_(self.viewport().mapToGlobal(position))
 
-    def show_log(self, key, log: Sequence[PaymentAttemptLog]):
+    def show_log(self, key, log: Sequence[HtlcLog]):
         d = WindowModalDialog(self, _("Payment log"))
         d.setMinimumWidth(600)
         vbox = QVBoxLayout(d)

@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Sequence, Optional
 
 from aiorpcx.curio import timeout_after, TaskTimeout, TaskGroup
+import aiohttp
 
 from . import util
 from .bitcoin import COIN
@@ -82,8 +83,11 @@ class ExchangeBase(Logger):
         except asyncio.CancelledError:
             # CancelledError must be passed-through for cancellation to work
             raise
-        except BaseException as e:
+        except aiohttp.ClientError as e:
             self.logger.info(f"failed fx quotes: {repr(e)}")
+            self.quotes = {}
+        except Exception as e:
+            self.logger.exception(f"failed fx quotes: {repr(e)}")
             self.quotes = {}
         self.on_quotes()
 
@@ -110,8 +114,11 @@ class ExchangeBase(Logger):
             self.logger.info(f"requesting fx history for {ccy}")
             h = await self.request_history(ccy)
             self.logger.info(f"received fx history for {ccy}")
-        except BaseException as e:
+        except aiohttp.ClientError as e:
             self.logger.info(f"failed fx history: {repr(e)}")
+            return
+        except Exception as e:
+            self.logger.exception(f"failed fx history: {repr(e)}")
             return
         filename = os.path.join(cache_dir, self.name() + '_' + ccy)
         with open(filename, 'w', encoding='utf-8') as f:
@@ -315,6 +322,13 @@ class CoinGecko(ExchangeBase):
                      for h in history['prices']])
 
 
+class CointraderMonitor(ExchangeBase):
+
+    async def get_rates(self, ccy):
+        json = await self.get_json('cointradermonitor.com', '/api/pbb/v1/ticker')
+        return {'BRL': Decimal(json['last'])}
+
+
 class itBit(ExchangeBase):
 
     async def get_rates(self, ccy):
@@ -352,12 +366,6 @@ class MercadoBitcoin(ExchangeBase):
         return {'BRL': Decimal(json['ticker_1h']['exchanges']['MBT']['last'])}
 
 
-class NegocieCoins(ExchangeBase):
-
-    async def get_rates(self,ccy):
-        json = await self.get_json('api.bitvalor.com', '/v1/ticker.json')
-        return {'BRL': Decimal(json['ticker_1h']['exchanges']['NEG']['last'])}
-
 class TheRockTrading(ExchangeBase):
 
     async def get_rates(self, ccy):
@@ -387,6 +395,28 @@ class Zaif(ExchangeBase):
     async def get_rates(self, ccy):
         json = await self.get_json('api.zaif.jp', '/api/1/last_price/btc_jpy')
         return {'JPY': Decimal(json['last_price'])}
+
+
+class Bitragem(ExchangeBase):
+
+    async def get_rates(self,ccy):
+        json = await self.get_json('api.bitragem.com', '/v1/index?asset=BTC&market=BRL')
+        return {'BRL': Decimal(json['response']['index'])}
+
+
+class Biscoint(ExchangeBase):
+
+    async def get_rates(self,ccy):
+        json = await self.get_json('api.biscoint.io', '/v1/ticker?base=BTC&quote=BRL')
+        return {'BRL': Decimal(json['data']['last'])}
+
+
+class Walltime(ExchangeBase):
+
+    async def get_rates(self, ccy):
+        json = await self.get_json('s3.amazonaws.com', 
+                             '/data-production-walltime-info/production/dynamic/walltime-info.json')
+        return {'BRL': Decimal(json['BRL_XBT']['last_inexact'])}
 
 
 def dictinvert(d):
@@ -516,8 +546,11 @@ class FxThread(ThreadJob):
         self.config.set_key('use_exchange_rate', bool(b))
         self.trigger_update()
 
-    def get_history_config(self, *, default=False):
-        return bool(self.config.get('history_rates', default))
+    def get_history_config(self, *, allow_none=False):
+        val = self.config.get('history_rates', None)
+        if val is None and allow_none:
+            return None
+        return bool(val)
 
     def set_history_config(self, b):
         self.config.set_key('history_rates', bool(b))
@@ -544,7 +577,7 @@ class FxThread(ThreadJob):
     def show_history(self):
         return self.is_enabled() and self.get_history_config() and self.ccy in self.exchange.history_ccys()
 
-    def set_currency(self, ccy):
+    def set_currency(self, ccy: str):
         self.ccy = ccy
         self.config.set_key('currency', ccy, True)
         self.trigger_update()
@@ -574,17 +607,25 @@ class FxThread(ThreadJob):
 
     def exchange_rate(self) -> Decimal:
         """Returns the exchange rate as a Decimal"""
+        if not self.is_enabled():
+            return Decimal('NaN')
         rate = self.exchange.quotes.get(self.ccy)
         if rate is None:
             return Decimal('NaN')
         return Decimal(rate)
 
-    def format_amount(self, btc_balance):
-        rate = self.exchange_rate()
+    def format_amount(self, btc_balance, *, timestamp: int = None) -> str:
+        if timestamp is None:
+            rate = self.exchange_rate()
+        else:
+            rate = self.timestamp_rate(timestamp)
         return '' if rate.is_nan() else "%s" % self.value_str(btc_balance, rate)
 
-    def format_amount_and_units(self, btc_balance):
-        rate = self.exchange_rate()
+    def format_amount_and_units(self, btc_balance, *, timestamp: int = None) -> str:
+        if timestamp is None:
+            rate = self.exchange_rate()
+        else:
+            rate = self.timestamp_rate(timestamp)
         return '' if rate.is_nan() else "%s %s" % (self.value_str(btc_balance, rate), self.ccy)
 
     def get_fiat_status_text(self, btc_balance, base_unit, decimal_point):
@@ -592,18 +633,18 @@ class FxThread(ThreadJob):
         return _("  (No FX rate available)") if rate.is_nan() else " 1 %s~%s %s" % (base_unit,
             self.value_str(COIN / (10**(8 - decimal_point)), rate), self.ccy)
 
-    def fiat_value(self, satoshis, rate):
+    def fiat_value(self, satoshis, rate) -> Decimal:
         return Decimal('NaN') if satoshis is None else Decimal(satoshis) / COIN * Decimal(rate)
 
-    def value_str(self, satoshis, rate):
+    def value_str(self, satoshis, rate) -> str:
         return self.format_fiat(self.fiat_value(satoshis, rate))
 
-    def format_fiat(self, value):
+    def format_fiat(self, value: Decimal) -> str:
         if value.is_nan():
             return _("No data")
         return "%s" % (self.ccy_amount_str(value, True))
 
-    def history_rate(self, d_t):
+    def history_rate(self, d_t: Optional[datetime]) -> Decimal:
         if d_t is None:
             return Decimal('NaN')
         rate = self.exchange.historical_rate(self.ccy, d_t)
@@ -616,13 +657,13 @@ class FxThread(ThreadJob):
             rate = 'NaN'
         return Decimal(rate)
 
-    def historical_value_str(self, satoshis, d_t):
+    def historical_value_str(self, satoshis, d_t: Optional[datetime]) -> str:
         return self.format_fiat(self.historical_value(satoshis, d_t))
 
-    def historical_value(self, satoshis, d_t):
+    def historical_value(self, satoshis, d_t: Optional[datetime]) -> Decimal:
         return self.fiat_value(satoshis, self.history_rate(d_t))
 
-    def timestamp_rate(self, timestamp):
+    def timestamp_rate(self, timestamp: Optional[int]) -> Decimal:
         from .util import timestamp_to_datetime
         date = timestamp_to_datetime(timestamp)
         return self.history_rate(date)

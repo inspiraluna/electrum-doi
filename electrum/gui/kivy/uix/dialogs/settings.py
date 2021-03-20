@@ -9,16 +9,18 @@ from electrum.gui.kivy.i18n import _
 from electrum.plugin import run_hook
 from electrum import coinchooser
 
+from electrum.gui.kivy import KIVY_GUI_PATH
+
 from .choice_dialog import ChoiceDialog
 
 Builder.load_string('''
 #:import partial functools.partial
 #:import _ electrum.gui.kivy.i18n._
+#:import messages electrum.gui.messages
 
 <SettingsDialog@Popup>
     id: settings
     title: _('Electrum Settings')
-    disable_password: False
     has_pin_code: False
     use_encryption: False
     BoxLayout:
@@ -61,16 +63,6 @@ Builder.load_string('''
                     action: partial(root.plugin_dialog, 'labels', self)
                 CardSeparator
                 SettingsItem:
-                    status: 'ON' if app.use_rbf else 'OFF'
-                    title: _('Replace-by-fee') + ': ' + self.status
-                    description: _("Create replaceable transactions.")
-                    message:
-                        _('If you check this box, your transactions will be marked as non-final,') \
-                        + ' ' + _('and you will have the possibility, while they are unconfirmed, to replace them with transactions that pays higher fees.') \
-                        + ' ' + _('Note that some merchants do not accept non-final transactions until they are confirmed.')
-                    action: partial(root.boolean_dialog, 'use_rbf', _('Replace by fee'), self.message)
-                CardSeparator
-                SettingsItem:
                     status: _('Yes') if app.use_unconfirmed else _('No')
                     title: _('Spend unconfirmed') + ': ' + self.status
                     description: _("Use unconfirmed coins in transactions.")
@@ -85,17 +77,22 @@ Builder.load_string('''
                     action: partial(root.boolean_dialog, 'use_change', _('Use change addresses'), self.message)
                 CardSeparator
                 SettingsItem:
-                    disabled: root.disable_password
                     title: _('Password')
-                    description: _("Change wallet password.")
+                    description: _('Change your password') if app._use_single_password else _("Change your password for this wallet.")
                     action: root.change_password
                 CardSeparator
                 SettingsItem:
-                    status: _('Yes') if app.android_backups else _('No')
-                    title: _('Backups') + ': ' + self.status
-                    description: _("Backup wallet to external storage.")
-                    message: _("If this option is checked, a backup of your wallet will be written to external storage everytime you create a new channel. Make sure your wallet is protected with a strong password before you enable this option.")
-                    action: partial(root.boolean_dialog, 'android_backups', _('Backups'), self.message)
+                    status: _('Yes') if app.use_recoverable_channels else _('No')
+                    title: _('Use recoverable channels') + ': ' + self.status
+                    description: _("Add channel recovery data to funding transaction.")
+                    message: _(messages.MSG_RECOVERABLE_CHANNELS)
+                    action: partial(root.boolean_dialog, 'use_recoverable_channels', _('Use recoverable_channels'), self.message)
+                CardSeparator
+                SettingsItem:
+                    status: _('Trampoline') if not app.use_gossip else _('Gossip')
+                    title: _('Lightning Routing') + ': ' + self.status
+                    description: _("Use trampoline routing or gossip.")
+                    action: partial(root.routing_dialog, self)
 
                 # disabled: there is currently only one coin selection policy
                 #CardSeparator
@@ -126,7 +123,6 @@ class SettingsDialog(Factory.Popup):
 
     def update(self):
         self.wallet = self.app.wallet
-        self.disable_password = self.wallet.is_watching_only() if self.wallet else True
         self.use_encryption = self.wallet.has_password() if self.wallet else False
         self.has_pin_code = self.app.has_pin_code()
 
@@ -157,6 +153,22 @@ class SettingsDialog(Factory.Popup):
             self._unit_dialog = ChoiceDialog(_('Denomination'), base_units_list,
                                              self.app.base_unit, cb, keep_choice_order=True)
         self._unit_dialog.open()
+
+    def routing_dialog(self, item, dt):
+        description = \
+            _('Lightning payments require finding a path through the Lightning Network.')\
+            + ' ' + ('You may use trampoline routing, or local routing (gossip).')\
+            + ' ' + ('Downloading the network gossip uses quite some bandwidth and storage, and is not recommended on mobile devices.')\
+            + ' ' + ('If you use trampoline, you can only open channels with trampoline nodes.')
+        def cb(text):
+            self.app.use_gossip = (text == 'Gossip')
+        dialog = ChoiceDialog(
+            _('Lightning Routing'),
+            ['Trampoline', 'Gossip'],
+            'Gossip' if self.app.use_gossip else 'Trampoline',
+            cb, description=description,
+            keep_choice_order=True)
+        dialog.open()
 
     def coinselect_status(self):
         return coinchooser.get_name(self.app.electrum_config)
@@ -196,7 +208,7 @@ class SettingsDialog(Factory.Popup):
                 net_params = net_params._replace(proxy=proxy)
                 network.run_from_another_thread(network.set_parameters(net_params))
                 item.status = self.proxy_status()
-            popup = Builder.load_file('electrum/gui/kivy/uix/ui_screens/proxy.kv')
+            popup = Builder.load_file(KIVY_GUI_PATH + '/uix/ui_screens/proxy.kv')
             popup.ids.mode.text = proxy.get('mode') if proxy else 'None'
             popup.ids.host.text = proxy.get('host') if proxy else ''
             popup.ids.port.text = proxy.get('port') if proxy else ''
@@ -217,9 +229,6 @@ class SettingsDialog(Factory.Popup):
         fullname = dd.get('fullname')
         d = CheckBoxDialog(fullname, descr, status, callback)
         d.open()
-
-    def fee_status(self):
-        return self.config.get_fee_status()
 
     def boolean_dialog(self, name, title, message, dt):
         from .checkbox_dialog import CheckBoxDialog

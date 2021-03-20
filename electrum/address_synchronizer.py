@@ -28,9 +28,11 @@ import itertools
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, Optional, Set, Tuple, NamedTuple, Sequence, List
 
+from aiorpcx import TaskGroup
+
 from . import bitcoin, util
 from .bitcoin import COINBASE_MATURITY
-from .util import profiler, bfh, TxMinedInfo
+from .util import profiler, bfh, TxMinedInfo, UnrelatedTransactionException
 from .transaction import Transaction, TxOutput, TxInput, PartialTxInput, TxOutpoint, PartialTransaction
 from .synchronizer import Synchronizer
 from .verifier import SPV
@@ -48,21 +50,21 @@ TX_HEIGHT_LOCAL = -2
 TX_HEIGHT_UNCONF_PARENT = -1
 TX_HEIGHT_UNCONFIRMED = 0
 
-class AddTransactionException(Exception):
-    pass
-
-
-class UnrelatedTransactionException(AddTransactionException):
-    def __str__(self):
-        return _("Transaction is unrelated to this wallet.")
-
 
 class HistoryItem(NamedTuple):
     txid: str
     tx_mined_status: TxMinedInfo
-    delta: Optional[int]
+    delta: int
     fee: Optional[int]
-    balance: Optional[int]
+    balance: int
+
+
+class TxWalletDelta(NamedTuple):
+    is_relevant: bool  # "related to wallet?"
+    is_any_input_ismine: bool
+    is_all_input_ismine: bool
+    delta: int
+    fee: Optional[int]
 
 
 class AddressSynchronizer(Logger):
@@ -96,8 +98,14 @@ class AddressSynchronizer(Logger):
 
         self.load_and_cleanup()
 
+    def with_lock(func):
+        def func_wrapper(self: 'AddressSynchronizer', *args, **kwargs):
+            with self.lock:
+                return func(self, *args, **kwargs)
+        return func_wrapper
+
     def with_transaction_lock(func):
-        def func_wrapper(self, *args, **kwargs):
+        def func_wrapper(self: 'AddressSynchronizer', *args, **kwargs):
             with self.transaction_lock:
                 return func(self, *args, **kwargs)
         return func_wrapper
@@ -143,10 +151,31 @@ class AddressSynchronizer(Logger):
         prevout_hash = txin.prevout.txid.hex()
         prevout_n = txin.prevout.out_idx
         for addr in self.db.get_txo_addresses(prevout_hash):
-            l = self.db.get_txo_addr(prevout_hash, addr)
-            for n, v, is_cb in l:
-                if n == prevout_n:
-                    return addr
+            d = self.db.get_txo_addr(prevout_hash, addr)
+            if prevout_n in d:
+                return addr
+        tx = self.db.get_transaction(prevout_hash)
+        if tx:
+            return tx.outputs()[prevout_n].address
+        return None
+
+    def get_txin_value(self, txin: TxInput, *, address: str = None) -> Optional[int]:
+        if txin.value_sats() is not None:
+            return txin.value_sats()
+        prevout_hash = txin.prevout.txid.hex()
+        prevout_n = txin.prevout.out_idx
+        if address is None:
+            address = self.get_txin_address(txin)
+        if address:
+            d = self.db.get_txo_addr(prevout_hash, address)
+            try:
+                v, cb = d[prevout_n]
+                return v
+            except KeyError:
+                pass
+        tx = self.db.get_transaction(prevout_hash)
+        if tx:
+            return tx.outputs()[prevout_n].value
         return None
 
     def get_txout_address(self, txo: TxOutput) -> Optional[str]:
@@ -170,16 +199,19 @@ class AddressSynchronizer(Logger):
     def on_blockchain_updated(self, event, *args):
         self._get_addr_balance_cache = {}  # invalidate cache
 
-    def stop(self):
+    async def stop(self):
         if self.network:
-            if self.synchronizer:
-                asyncio.run_coroutine_threadsafe(self.synchronizer.stop(), self.network.asyncio_loop)
+            try:
+                async with TaskGroup() as group:
+                    if self.synchronizer:
+                        await group.spawn(self.synchronizer.stop())
+                    if self.verifier:
+                        await group.spawn(self.verifier.stop())
+            finally:  # even if we get cancelled
                 self.synchronizer = None
-            if self.verifier:
-                asyncio.run_coroutine_threadsafe(self.verifier.stop(), self.network.asyncio_loop)
                 self.verifier = None
-            util.unregister_callback(self.on_blockchain_updated)
-            self.db.put('stored_height', self.get_local_height())
+                util.unregister_callback(self.on_blockchain_updated)
+                self.db.put('stored_height', self.get_local_height())
 
     def add_address(self, address):
         if not self.db.get_addr_history(address):
@@ -265,24 +297,21 @@ class AddressSynchronizer(Logger):
                     # this is a local tx that conflicts with non-local txns; drop.
                     return False
                 # keep this txn and remove all conflicting
-                to_remove = set()
-                to_remove |= conflicting_txns
-                for conflicting_tx_hash in conflicting_txns:
-                    to_remove |= self.get_depending_transactions(conflicting_tx_hash)
-                for tx_hash2 in to_remove:
+                for tx_hash2 in conflicting_txns:
                     self.remove_transaction(tx_hash2)
             # add inputs
             def add_value_from_prev_output():
-                # note: this nested loop takes linear time in num is_mine outputs of prev_tx
-                for addr in self.db.get_txo_addresses(prevout_hash):
+                # note: this takes linear time in num is_mine outputs of prev_tx
+                addr = self.get_txin_address(txi)
+                if addr and self.is_mine(addr):
                     outputs = self.db.get_txo_addr(prevout_hash, addr)
-                    # note: instead of [(n, v, is_cb), ...]; we could store: {n -> (v, is_cb)}
-                    for n, v, is_cb in outputs:
-                        if n == prevout_n:
-                            if addr and self.is_mine(addr):
-                                self.db.add_txi_addr(tx_hash, addr, ser, v)
-                                self._get_addr_balance_cache.pop(addr, None)  # invalidate cache
-                            return
+                    try:
+                        v, is_cb = outputs[prevout_n]
+                    except KeyError:
+                        pass
+                    else:
+                        self.db.add_txi_addr(tx_hash, addr, ser, v)
+                        self._get_addr_balance_cache.pop(addr, None)  # invalidate cache
             for txi in tx.inputs():
                 if txi.is_coinbase_input():
                     continue
@@ -314,6 +343,19 @@ class AddressSynchronizer(Logger):
             return True
 
     def remove_transaction(self, tx_hash: str) -> None:
+        """Removes a transaction AND all its dependents/children
+        from the wallet history.
+        """
+        with self.lock, self.transaction_lock:
+            to_remove = {tx_hash}
+            to_remove |= self.get_depending_transactions(tx_hash)
+            for txid in to_remove:
+                self._remove_transaction(txid)
+
+    def _remove_transaction(self, tx_hash: str) -> None:
+        """Removes a single transaction from the wallet history, and attempts
+         to undo all effects of the tx (spending inputs, creating outputs, etc).
+        """
         def remove_from_spent_outpoints():
             # undo spends in spent_outpoints
             if tx is not None:
@@ -420,6 +462,8 @@ class AddressSynchronizer(Logger):
         with self.lock:
             with self.transaction_lock:
                 self.db.clear_history()
+                self._history_local.clear()
+                self._get_addr_balance_cache = {}  # invalidate cache
 
     def get_txpos(self, tx_hash):
         """Returns (height, txpos) tuple, even if the tx is unverified."""
@@ -445,6 +489,8 @@ class AddressSynchronizer(Logger):
                 self.threadlocal_cache.local_height = orig_val
         return f
 
+    @with_lock
+    @with_transaction_lock
     @with_local_height_cached
     def get_history(self, *, domain=None) -> Sequence[HistoryItem]:
         # get domain
@@ -453,15 +499,11 @@ class AddressSynchronizer(Logger):
         domain = set(domain)
         # 1. Get the history of each address in the domain, maintain the
         #    delta of a tx as the sum of its deltas on domain addresses
-        tx_deltas = defaultdict(int)  # type: Dict[str, Optional[int]]
+        tx_deltas = defaultdict(int)  # type: Dict[str, int]
         for addr in domain:
             h = self.get_address_history(addr)
             for tx_hash, height in h:
-                delta = self.get_tx_delta(tx_hash, addr)
-                if delta is None or tx_deltas[tx_hash] is None:
-                    tx_deltas[tx_hash] = None
-                else:
-                    tx_deltas[tx_hash] += delta
+                tx_deltas[tx_hash] += self.get_tx_delta(tx_hash, addr)
         # 2. create sorted history
         history = []
         for tx_hash in tx_deltas:
@@ -480,15 +522,11 @@ class AddressSynchronizer(Logger):
                                   delta=delta,
                                   fee=fee,
                                   balance=balance))
-            if balance is None or delta is None:
-                balance = None
-            else:
-                balance -= delta
+            balance -= delta
         h2.reverse()
-        # fixme: this may happen if history is incomplete
-        if balance not in [None, 0]:
-            self.logger.warning("history not synchronized")
-            return []
+
+        if balance != 0:
+            raise Exception("wallet.get_history() failed balance sanity-check")
 
         return h2
 
@@ -617,10 +655,12 @@ class AddressSynchronizer(Logger):
 
     def set_up_to_date(self, up_to_date):
         with self.lock:
+            status_changed = self.up_to_date != up_to_date
             self.up_to_date = up_to_date
         if self.network:
             self.network.notify('status')
-        self.logger.info(f'set_up_to_date: {up_to_date}')
+        if status_changed:
+            self.logger.info(f'set_up_to_date: {up_to_date}')
 
     def is_up_to_date(self):
         with self.lock: return self.up_to_date
@@ -632,86 +672,56 @@ class AddressSynchronizer(Logger):
             return 0, 0
 
     @with_transaction_lock
-    def get_tx_delta(self, tx_hash, address):
+    def get_tx_delta(self, tx_hash: str, address: str) -> int:
         """effect of tx on address"""
         delta = 0
-        # substract the value of coins sent from address
+        # subtract the value of coins sent from address
         d = self.db.get_txi_addr(tx_hash, address)
         for n, v in d:
             delta -= v
         # add the value of the coins received at address
         d = self.db.get_txo_addr(tx_hash, address)
-        for n, v, cb in d:
+        for n, (v, cb) in d.items():
             delta += v
         return delta
 
-    @with_transaction_lock
-    def get_tx_value(self, txid):
-        """effect of tx on the entire domain"""
-        delta = 0
-        for addr in self.db.get_txi_addresses(txid):
-            d = self.db.get_txi_addr(txid, addr)
-            for n, v in d:
-                delta -= v
-        for addr in self.db.get_txo_addresses(txid):
-            d = self.db.get_txo_addr(txid, addr)
-            for n, v, cb in d:
-                delta += v
-        return delta
-
-    def get_wallet_delta(self, tx: Transaction):
-        """ effect of tx on wallet """
+    def get_wallet_delta(self, tx: Transaction) -> TxWalletDelta:
+        """effect of tx on wallet"""
         is_relevant = False  # "related to wallet?"
-        is_mine = False
-        is_pruned = False
-        is_partial = False
-        v_in = v_out = v_out_mine = 0
-        for txin in tx.inputs():
-            addr = self.get_txin_address(txin)
-            if self.is_mine(addr):
-                is_mine = True
-                is_relevant = True
-                d = self.db.get_txo_addr(txin.prevout.txid.hex(), addr)
-                for n, v, cb in d:
-                    if n == txin.prevout.out_idx:
-                        value = v
-                        break
-                else:
-                    value = None
+        num_input_ismine = 0
+        v_in = v_in_mine = v_out = v_out_mine = 0
+        with self.lock, self.transaction_lock:
+            for txin in tx.inputs():
+                addr = self.get_txin_address(txin)
+                value = self.get_txin_value(txin, address=addr)
+                if self.is_mine(addr):
+                    num_input_ismine += 1
+                    is_relevant = True
+                    assert value is not None
+                    v_in_mine += value
                 if value is None:
-                    value = txin.value_sats()
-                if value is None:
-                    is_pruned = True
-                else:
+                    v_in = None
+                elif v_in is not None:
                     v_in += value
-            else:
-                is_partial = True
-        if not is_mine:
-            is_partial = False
-        for o in tx.outputs():
-            v_out += o.value
-            if self.is_mine(o.address):
-                v_out_mine += o.value
-                is_relevant = True
-        if is_pruned:
-            # some inputs are mine:
-            fee = None
-            if is_mine:
-                v = v_out_mine - v_out
-            else:
-                # no input is mine
-                v = v_out_mine
+            for txout in tx.outputs():
+                v_out += txout.value
+                if self.is_mine(txout.address):
+                    v_out_mine += txout.value
+                    is_relevant = True
+        delta = v_out_mine - v_in_mine
+        if v_in is not None:
+            fee = v_in - v_out
         else:
-            v = v_out_mine - v_in
-            if is_partial:
-                # some inputs are mine, but not all
-                fee = None
-            else:
-                # all inputs are mine
-                fee = v_in - v_out
-        if not is_mine:
             fee = None
-        return is_relevant, is_mine, v, fee
+        if fee is None and isinstance(tx, PartialTransaction):
+            fee = tx.get_fee()
+        return TxWalletDelta(
+            is_relevant=is_relevant,
+            is_any_input_ismine=num_input_ismine > 0,
+            is_all_input_ismine=num_input_ismine == len(tx.inputs()),
+            delta=delta,
+            fee=fee,
+        )
 
     def get_tx_fee(self, txid: str) -> Optional[int]:
         """ Returns tx_fee or None. Use server fee only if tx is unconfirmed and not mine"""
@@ -738,8 +748,7 @@ class AddressSynchronizer(Logger):
         tx = self.db.get_transaction(txid)
         if not tx:
             return None
-        with self.lock, self.transaction_lock:
-            is_relevant, is_mine, v, fee = self.get_wallet_delta(tx)
+        fee = self.get_wallet_delta(tx).fee
         # save result
         self.db.add_tx_fee_we_calculated(txid, fee)
         self.db.add_num_inputs_to_tx(txid, len(tx.inputs()))
@@ -751,8 +760,8 @@ class AddressSynchronizer(Logger):
             received = {}
             sent = {}
             for tx_hash, height in h:
-                l = self.db.get_txo_addr(tx_hash, address)
-                for n, v, is_cb in l:
+                d = self.db.get_txo_addr(tx_hash, address)
+                for n, (v, is_cb) in d.items():
                     received[tx_hash + ':%d'%n] = (height, v, is_cb)
             for tx_hash, height in h:
                 l = self.db.get_txi_addr(tx_hash, address)
@@ -760,20 +769,26 @@ class AddressSynchronizer(Logger):
                     sent[txi] = height
         return received, sent
 
-    def get_addr_utxo(self, address: str) -> Dict[TxOutpoint, PartialTxInput]:
+
+    def get_addr_outputs(self, address: str) -> Dict[TxOutpoint, PartialTxInput]:
         coins, spent = self.get_addr_io(address)
-        for txi in spent:
-            coins.pop(txi)
         out = {}
         for prevout_str, v in coins.items():
             tx_height, value, is_cb = v
             prevout = TxOutpoint.from_str(prevout_str)
-            utxo = PartialTxInput(prevout=prevout,
-                                  is_coinbase_output=is_cb)
+            utxo = PartialTxInput(prevout=prevout, is_coinbase_output=is_cb)
             utxo._trusted_address = address
             utxo._trusted_value_sats = value
             utxo.block_height = tx_height
+            utxo.spent_height = spent.get(prevout_str, None)
             out[prevout] = utxo
+        return out
+
+    def get_addr_utxo(self, address: str) -> Dict[TxOutpoint, PartialTxInput]:
+        out = self.get_addr_outputs(address)
+        for k, v in list(out.items()):
+            if v.spent_height is not None:
+                out.pop(k)
         return out
 
     # return the total amount ever received by an address

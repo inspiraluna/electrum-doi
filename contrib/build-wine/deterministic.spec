@@ -10,8 +10,6 @@ for i, x in enumerate(sys.argv):
 else:
     raise Exception('no name')
 
-PYHOME = 'c:/python3'
-
 home = 'C:\\electrum\\'
 
 # see https://github.com/pyinstaller/pyinstaller/issues/2005
@@ -34,6 +32,7 @@ binaries += [b for b in collect_dynamic_libs('PyQt5') if 'qwindowsvista' in b[0]
 
 binaries += [('C:/tmp/libsecp256k1-0.dll', '.')]
 binaries += [('C:/tmp/libusb-1.0.dll', '.')]
+binaries += [('C:/tmp/libzbar-0.dll', '.')]
 
 datas = [
     (home+'electrum/*.json', 'electrum'),
@@ -41,7 +40,6 @@ datas = [
     (home+'electrum/wordlist/english.txt', 'electrum/wordlist'),
     (home+'electrum/locale', 'electrum/locale'),
     (home+'electrum/plugins', 'electrum/plugins'),
-    ('C:\\Program Files (x86)\\ZBar\\bin\\', '.'),
     (home+'electrum/gui/icons', 'electrum/gui/icons'),
 ]
 datas += collect_data_files('trezorlib')
@@ -139,7 +137,7 @@ exe_portable = EXE(
 #####
 # exe and separate files that NSIS uses to build installer "setup" exe
 
-exe_dependent = EXE(
+exe_inside_setup_noconsole = EXE(
     pyz,
     a.scripts,
     exclude_binaries=True,
@@ -150,8 +148,20 @@ exe_dependent = EXE(
     icon=home+'electrum/gui/icons/electrum.ico',
     console=False)
 
+exe_inside_setup_console = EXE(
+    pyz,
+    a.scripts,
+    exclude_binaries=True,
+    name=os.path.join('build\\pyi.win32\\electrum', cmdline_name+"-debug"),
+    debug=False,
+    strip=None,
+    upx=False,
+    icon=home+'electrum/gui/icons/electrum.ico',
+    console=True)
+
 coll = COLLECT(
-    exe_dependent,
+    exe_inside_setup_noconsole,
+    exe_inside_setup_console,
     a.binaries,
     a.zipfiles,
     a.datas,

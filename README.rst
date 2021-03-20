@@ -55,9 +55,8 @@ libsecp256k1 yourself::
     sudo apt-get install automake libtool
     ./contrib/make_libsecp256k1.sh
 
-Due to the need for fast symmetric ciphers, either one of `pycryptodomex`_
-or `cryptography`_ is required. Install from your package manager
-(or from pip)::
+Due to the need for fast symmetric ciphers, `cryptography`_ is required.
+Install from your package manager (or from pip)::
 
     sudo apt-get install python3-cryptography
 
@@ -121,7 +120,7 @@ Creating Binaries
 Linux (tarball)
 ---------------
 
-See :code:`contrib/build-linux/README.md`.
+See :code:`contrib/build-linux/sdist/README.md`.
 
 
 Linux (AppImage)
@@ -145,4 +144,4 @@ See :code:`contrib/build-wine/README.md`.
 Android
 -------
 
-See :code:`electrum/gui/kivy/Readme.md`.
+See :code:`contrib/android/Readme.md`.

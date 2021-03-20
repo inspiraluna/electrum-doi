@@ -53,11 +53,13 @@ if platform.system() in ['Linux', 'FreeBSD', 'DragonFly']:
 extras_require = {
     'hardware': requirements_hw,
     'gui': ['pyqt5'],
-    'crypto': ['pycryptodomex>=3.7'],
-    'tests': ['pycryptodomex>=3.7', 'cryptography>=2.1'],
+    'crypto': ['cryptography>=2.6'],
+    'tests': ['pycryptodomex>=3.7', 'cryptography>=2.6', 'pyaes>=0.1a1'],
 }
 # 'full' extra that tries to grab everything an enduser would need (except for libsecp256k1...)
-extras_require['full'] = [pkg for sublist in ['hardware', 'gui', 'crypto'] for pkg in sublist]
+extras_require['full'] = [pkg for sublist in
+                          (extras_require['hardware'], extras_require['gui'], extras_require['crypto'])
+                          for pkg in sublist]
 # legacy. keep 'fast' extra working
 extras_require['fast'] = extras_require['crypto']
 

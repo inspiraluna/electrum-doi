@@ -73,7 +73,7 @@ class OpenFileEventFilter(QObject):
     def eventFilter(self, obj, event):
         if event.type() == QtCore.QEvent.FileOpen:
             if len(self.windows) >= 1:
-                self.windows[0].pay_to_URI(event.url().toEncoded())
+                self.windows[0].pay_to_URI(event.url().toString())
                 return True
         return False
 
@@ -201,13 +201,14 @@ class ElectrumGui(Logger):
             self.lightning_dialog.close()
         if self.watchtower_dialog:
             self.watchtower_dialog.close()
+        self.app.quit()
 
     def new_window(self, path, uri=None):
         # Use a signal as can be called from daemon thread
         self.app.new_window_signal.emit(path, uri)
 
     def show_lightning_dialog(self):
-        if not self.daemon.network.is_lightning_running():
+        if not self.daemon.network.has_channel_db():
             return
         if not self.lightning_dialog:
             self.lightning_dialog = LightningDialog(self)
@@ -232,8 +233,6 @@ class ElectrumGui(Logger):
         w = ElectrumWindow(self, wallet)
         self.windows.append(w)
         self.build_tray_menu()
-        # FIXME: Remove in favour of the load_wallet hook
-        run_hook('on_new_window', w)
         w.warn_if_testnet()
         w.warn_if_watching_only()
         return w

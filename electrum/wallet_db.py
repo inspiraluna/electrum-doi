@@ -33,15 +33,17 @@ import binascii
 
 from . import util, bitcoin
 from .util import profiler, WalletFileException, multisig_type, TxMinedInfo, bfh
-from .invoices import PR_TYPE_ONCHAIN, invoice_from_json
+from .invoices import PR_TYPE_ONCHAIN, Invoice
 from .keystore import bip44_derivation
 from .transaction import Transaction, TxOutpoint, tx_from_any, PartialTransaction, PartialTxOutput
 from .logging import Logger
-from .lnutil import LOCAL, REMOTE, FeeUpdate, UpdateAddHtlc, LocalConfig, RemoteConfig, Keypair, OnlyPubkeyKeypair, RevocationStore, ChannelBackupStorage
+from .lnutil import LOCAL, REMOTE, FeeUpdate, UpdateAddHtlc, LocalConfig, RemoteConfig, Keypair, OnlyPubkeyKeypair, RevocationStore
+from .lnutil import ImportedChannelBackupStorage, OnchainChannelBackupStorage
 from .lnutil import ChannelConstraints, Outpoint, ShachainElement
 from .json_db import StoredDict, JsonDB, locked, modifier
 from .plugin import run_hook, plugin_loaders
 from .paymentrequest import PaymentRequest
+from .submarine_swaps import SwapData
 
 if TYPE_CHECKING:
     from .storage import WalletStorage
@@ -51,7 +53,7 @@ if TYPE_CHECKING:
 
 OLD_SEED_VERSION = 4        # electrum versions < 2.0
 NEW_SEED_VERSION = 11       # electrum versions >= 2.0
-FINAL_SEED_VERSION = 29     # electrum >= 2.7 will set this to prevent
+FINAL_SEED_VERSION = 39     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
@@ -82,7 +84,7 @@ class WalletDB(JsonDB):
                 d = ast.literal_eval(s)
                 labels = d.get('labels', {})
             except Exception as e:
-                raise IOError("Cannot read wallet file")
+                raise WalletFileException("Cannot read wallet file. (parsing failed)")
             self.data = {}
             for key, value in d.items():
                 try:
@@ -176,6 +178,16 @@ class WalletDB(JsonDB):
         self._convert_version_27()
         self._convert_version_28()
         self._convert_version_29()
+        self._convert_version_30()
+        self._convert_version_31()
+        self._convert_version_32()
+        self._convert_version_33()
+        self._convert_version_34()
+        self._convert_version_35()
+        self._convert_version_36()
+        self._convert_version_37()
+        self._convert_version_38()
+        self._convert_version_39()
         self.put('seed_version', FINAL_SEED_VERSION)  # just to be sure
 
         self._after_upgrade_tasks()
@@ -519,7 +531,7 @@ class WalletDB(JsonDB):
         self.data['channels'] = { x['channel_id']: x for x in channels }
         # convert txi & txo
         txi = self.get('txi', {})
-        for tx_hash, d in txi.items():
+        for tx_hash, d in list(txi.items()):
             d2 = {}
             for addr, l in d.items():
                 d2[addr] = {}
@@ -528,7 +540,7 @@ class WalletDB(JsonDB):
             txi[tx_hash] = d2
         self.data['txi'] = txi
         txo = self.get('txo', {})
-        for tx_hash, d in txo.items():
+        for tx_hash, d in list(txo.items()):
             d2 = {}
             for addr, l in d.items():
                 d2[addr] = {}
@@ -619,7 +631,7 @@ class WalletDB(JsonDB):
                     'type': _type,
                     'message': r.get('message') or r.get('memo', ''),
                     'amount': r.get('amount'),
-                    'exp': r.get('exp', 0),
+                    'exp': r.get('exp') or 0,
                     'time': r.get('time', 0),
                 }
                 if _type == PR_TYPE_ONCHAIN:
@@ -641,6 +653,139 @@ class WalletDB(JsonDB):
                     })
                 d[key] = item
         self.data['seed_version'] = 29
+
+    def _convert_version_30(self):
+        if not self._is_upgrade_method_needed(29, 29):
+            return
+
+        from .invoices import PR_TYPE_ONCHAIN, PR_TYPE_LN
+        requests = self.data.get('payment_requests', {})
+        invoices = self.data.get('invoices', {})
+        for d in [invoices, requests]:
+            for key, item in list(d.items()):
+                _type = item['type']
+                if _type == PR_TYPE_ONCHAIN:
+                    item['amount_sat'] = item.pop('amount')
+                elif _type == PR_TYPE_LN:
+                    amount_sat = item.pop('amount')
+                    item['amount_msat'] = 1000 * amount_sat if amount_sat is not None else None
+                    item.pop('exp')
+                    item.pop('message')
+                    item.pop('rhash')
+                    item.pop('time')
+                else:
+                    raise Exception(f"unknown invoice type: {_type}")
+        self.data['seed_version'] = 30
+
+    def _convert_version_31(self):
+        if not self._is_upgrade_method_needed(30, 30):
+            return
+
+        from .invoices import PR_TYPE_ONCHAIN
+        requests = self.data.get('payment_requests', {})
+        invoices = self.data.get('invoices', {})
+        for d in [invoices, requests]:
+            for key, item in list(d.items()):
+                if item['type'] == PR_TYPE_ONCHAIN:
+                    item['amount_sat'] = item['amount_sat'] or 0
+                    item['exp'] = item['exp'] or 0
+                    item['time'] = item['time'] or 0
+        self.data['seed_version'] = 31
+
+    def _convert_version_32(self):
+        if not self._is_upgrade_method_needed(31, 31):
+            return
+        PR_TYPE_ONCHAIN = 0
+        invoices_old = self.data.get('invoices', {})
+        invoices_new = {k: item for k, item in invoices_old.items()
+                        if not (item['type'] == PR_TYPE_ONCHAIN and item['outputs'] is None)}
+        self.data['invoices'] = invoices_new
+        self.data['seed_version'] = 32
+
+    def _convert_version_33(self):
+        if not self._is_upgrade_method_needed(32, 32):
+            return
+        PR_TYPE_ONCHAIN = 0
+        requests = self.data.get('payment_requests', {})
+        invoices = self.data.get('invoices', {})
+        for d in [invoices, requests]:
+            for key, item in list(d.items()):
+                if item['type'] == PR_TYPE_ONCHAIN:
+                    item['height'] = item.get('height') or 0
+        self.data['seed_version'] = 33
+
+    def _convert_version_34(self):
+        if not self._is_upgrade_method_needed(33, 33):
+            return
+        channels = self.data.get('channels', {})
+        for key, item in channels.items():
+            item['local_config']['upfront_shutdown_script'] = \
+                item['local_config'].get('upfront_shutdown_script') or ""
+            item['remote_config']['upfront_shutdown_script'] = \
+                item['remote_config'].get('upfront_shutdown_script') or ""
+        self.data['seed_version'] = 34
+
+    def _convert_version_35(self):
+        # same as 32, but for payment_requests
+        if not self._is_upgrade_method_needed(34, 34):
+            return
+        PR_TYPE_ONCHAIN = 0
+        requests_old = self.data.get('payment_requests', {})
+        requests_new = {k: item for k, item in requests_old.items()
+                        if not (item['type'] == PR_TYPE_ONCHAIN and item['outputs'] is None)}
+        self.data['payment_requests'] = requests_new
+        self.data['seed_version'] = 35
+
+    def _convert_version_36(self):
+        if not self._is_upgrade_method_needed(35, 35):
+            return
+        old_frozen_coins = self.data.get('frozen_coins', [])
+        new_frozen_coins = {coin: True for coin in old_frozen_coins}
+        self.data['frozen_coins'] = new_frozen_coins
+        self.data['seed_version'] = 36
+
+    def _convert_version_37(self):
+        if not self._is_upgrade_method_needed(36, 36):
+            return
+        payments = self.data.get('lightning_payments', {})
+        for k, v in list(payments.items()):
+            amount_sat, direction, status = v
+            amount_msat = amount_sat * 1000 if amount_sat is not None else None
+            payments[k] = amount_msat, direction, status
+        self.data['lightning_payments'] = payments
+        self.data['seed_version'] = 37
+
+    def _convert_version_38(self):
+        if not self._is_upgrade_method_needed(37, 37):
+            return
+        PR_TYPE_ONCHAIN = 0
+        PR_TYPE_LN = 2
+        from .bitcoin import TOTAL_COIN_SUPPLY_LIMIT_IN_BTC, COIN
+        max_sats = TOTAL_COIN_SUPPLY_LIMIT_IN_BTC * COIN
+        requests = self.data.get('payment_requests', {})
+        invoices = self.data.get('invoices', {})
+        for d in [invoices, requests]:
+            for key, item in list(d.items()):
+                if item['type'] == PR_TYPE_ONCHAIN:
+                    amount_sat = item['amount_sat']
+                    if amount_sat == '!':
+                        continue
+                    if not (isinstance(amount_sat, int) and 0 <= amount_sat <= max_sats):
+                        del d[key]
+                elif item['type'] == PR_TYPE_LN:
+                    amount_msat = item['amount_msat']
+                    if not amount_msat:
+                        continue
+                    if not (isinstance(amount_msat, int) and 0 <= amount_msat <= max_sats * 1000):
+                        del d[key]
+        self.data['seed_version'] = 38
+
+    def _convert_version_39(self):
+        # this upgrade prevents initialization of lightning_privkey2 after lightning_xprv has been set
+        if not self._is_upgrade_method_needed(38, 38):
+            return
+        self.data['imported_channel_backups'] = self.data.pop('channel_backups', {})
+        self.data['seed_version'] = 39
 
     def _convert_imported(self):
         if not self._is_upgrade_method_needed(0, 13):
@@ -741,12 +886,12 @@ class WalletDB(JsonDB):
         return list(d.items())
 
     @locked
-    def get_txo_addr(self, tx_hash: str, address: str) -> Iterable[Tuple[int, int, bool]]:
-        """Returns an iterable of (output_index, value, is_coinbase)."""
+    def get_txo_addr(self, tx_hash: str, address: str) -> Dict[int, Tuple[int, bool]]:
+        """Returns a dict: output_index -> (value, is_coinbase)."""
         assert isinstance(tx_hash, str)
         assert isinstance(address, str)
         d = self.txo.get(tx_hash, {}).get(address, {})
-        return [(int(n), v, cb) for (n, (v, cb)) in d.items()]
+        return {int(n): (v, cb) for (n, (v, cb)) in d.items()}
 
     @modifier
     def add_txi_addr(self, tx_hash: str, addr: str, ser: str, v: int) -> None:
@@ -858,6 +1003,8 @@ class WalletDB(JsonDB):
         assert isinstance(tx_hash, str)
         assert isinstance(tx, Transaction), tx
         # note that tx might be a PartialTransaction
+        # serialize and de-serialize tx now. this might e.g. convert a complete PartialTx to a Tx
+        tx = tx_from_any(str(tx))
         if not tx_hash:
             raise Exception("trying to add tx to db without txid")
         if tx_hash != tx.txid():
@@ -998,7 +1145,7 @@ class WalletDB(JsonDB):
         self.tx_fees.pop(txid, None)
 
     @locked
-    def get_dict(self, name):
+    def get_dict(self, name) -> dict:
         # Warning: interacts un-intuitively with 'put': certain parts
         # of 'data' will have pointers saved as separate variables.
         if name not in self.data:
@@ -1126,15 +1273,19 @@ class WalletDB(JsonDB):
             # note: for performance, "deserialize=False" so that we will deserialize these on-demand
             v = dict((k, tx_from_any(x, deserialize=False)) for k, x in v.items())
         if key == 'invoices':
-            v = dict((k, invoice_from_json(x)) for k, x in v.items())
+            v = dict((k, Invoice.from_json(x)) for k, x in v.items())
         if key == 'payment_requests':
-            v = dict((k, invoice_from_json(x)) for k, x in v.items())
+            v = dict((k, Invoice.from_json(x)) for k, x in v.items())
         elif key == 'adds':
             v = dict((k, UpdateAddHtlc.from_tuple(*x)) for k, x in v.items())
         elif key == 'fee_updates':
             v = dict((k, FeeUpdate(**x)) for k, x in v.items())
-        elif key == 'channel_backups':
-            v = dict((k, ChannelBackupStorage(**x)) for k, x in v.items())
+        elif key == 'submarine_swaps':
+            v = dict((k, SwapData(**x)) for k, x in v.items())
+        elif key == 'imported_channel_backups':
+            v = dict((k, ImportedChannelBackupStorage(**x)) for k, x in v.items())
+        elif key == 'onchain_channel_backups':
+            v = dict((k, OnchainChannelBackupStorage(**x)) for k, x in v.items())
         elif key == 'tx_fees':
             v = dict((k, TxFeesValue(*x)) for k, x in v.items())
         elif key == 'prevouts_by_scripthash':
@@ -1156,17 +1307,27 @@ class WalletDB(JsonDB):
             v = Outpoint(**v)
         return v
 
+    def _should_convert_to_stored_dict(self, key) -> bool:
+        if key == 'keystore':
+            return False
+        multisig_keystore_names = [('x%d/' % i) for i in range(1, 16)]
+        if key in multisig_keystore_names:
+            return False
+        return True
+
     def write(self, storage: 'WalletStorage'):
         with self.lock:
             self._write(storage)
 
+    @profiler
     def _write(self, storage: 'WalletStorage'):
         if threading.currentThread().isDaemon():
             self.logger.warning('daemon thread cannot write db')
             return
         if not self.modified():
             return
-        storage.write(self.dump())
+        json_str = self.dump(human_readable=not storage.is_encrypted())
+        storage.write(json_str)
         self.set_modified(False)
 
     def is_ready_to_be_used_by_wallet(self):

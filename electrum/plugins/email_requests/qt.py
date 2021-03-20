@@ -43,7 +43,8 @@ from PyQt5.QtWidgets import (QVBoxLayout, QLabel, QGridLayout, QLineEdit,
                              QInputDialog)
 
 from electrum.gui.qt.util import (EnterButton, Buttons, CloseButton, OkButton,
-                                  WindowModalDialog, get_parent_main_window)
+                                  WindowModalDialog)
+from electrum.gui.qt.main_window import ElectrumWindow
 
 from electrum.plugin import BasePlugin, hook
 from electrum.paymentrequest import PaymentRequest
@@ -175,25 +176,27 @@ class Plugin(BasePlugin):
         #main_window.invoice_list.update()
 
     @hook
-    def receive_list_menu(self, menu, addr):
-        window = get_parent_main_window(menu)
+    def receive_list_menu(self, window: ElectrumWindow, menu, addr):
         menu.addAction(_("Send via e-mail"), lambda: self.send(window, addr))
 
-    def send(self, window, addr):
+    def send(self, window: ElectrumWindow, addr):
         from electrum import paymentrequest
-        r = window.wallet.receive_requests.get(addr)
-        message = r.get('memo', '')
-        if r.get('signature'):
-            pr = paymentrequest.serialize_request(r)
+        req = window.wallet.receive_requests.get(addr)
+        if not isinstance(req, OnchainInvoice):
+            window.show_error("Only on-chain requests are supported.")
+            return
+        message = req.message
+        if req.bip70:
+            payload = bytes.fromhex(req.bip70)
         else:
-            pr = paymentrequest.make_request(self.config, r)
-        if not pr:
+            pr = paymentrequest.make_request(self.config, req)
+            payload = pr.SerializeToString()
+        if not payload:
             return
         recipient, ok = QInputDialog.getText(window, 'Send request', 'Email invoice to:')
         if not ok:
             return
         recipient = str(recipient)
-        payload = pr.SerializeToString()
         self.logger.info(f'sending mail to {recipient}')
         try:
             # FIXME this runs in the GUI thread and blocks it...

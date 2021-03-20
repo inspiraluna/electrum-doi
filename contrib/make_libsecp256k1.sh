@@ -9,8 +9,12 @@
 # $ GCC_TRIPLET_HOST="i686-w64-mingw32" ./contrib/make_libsecp256k1.sh
 # Or for a Windows x86_64 (64-bit) target, run:
 # $ GCC_TRIPLET_HOST="x86_64-w64-mingw32" ./contrib/make_libsecp256k1.sh
+#
+# To cross-compile to Linux x86:
+# sudo apt-get install gcc-multilib g++-multilib
+# $ AUTOCONF_FLAGS="--host=i686-linux-gnu CFLAGS=-m32 CXXFLAGS=-m32 LDFLAGS=-m32" ./contrib/make_libsecp256k1.sh
 
-LIBSECP_VERSION="b408c6a8b287003d1ade5709e6f7bc3c7f1d5be7"
+LIBSECP_VERSION="dbd41db16a0e91b2566820898a3ab2d7dad4fe00"
 
 set -e
 
@@ -29,9 +33,13 @@ info "Building $pkgname..."
         git clone https://github.com/bitcoin-core/secp256k1.git
     fi
     cd secp256k1
+    if ! $(git cat-file -e ${LIBSECP_VERSION}) ; then
+        info "Could not find requested version $LIBSECP_VERSION in local clone; fetching..."
+        git fetch --all
+    fi
     git reset --hard
-    git clean -f -x -q
-    git checkout $LIBSECP_VERSION
+    git clean -dfxq
+    git checkout "${LIBSECP_VERSION}^{commit}"
 
     if ! [ -x configure ] ; then
         echo "libsecp256k1_la_LDFLAGS = -no-undefined" >> Makefile.am
@@ -45,8 +53,9 @@ info "Building $pkgname..."
             --enable-module-recovery \
             --enable-experimental \
             --enable-module-ecdh \
-            --disable-jni \
+            --disable-benchmark \
             --disable-tests \
+            --disable-exhaustive-tests \
             --disable-static \
             --enable-shared || fail "Could not configure $pkgname. Please make sure you have a C compiler installed and try again."
     fi
@@ -56,4 +65,7 @@ info "Building $pkgname..."
     host_strip "$here/$pkgname/dist/lib/$dlname"
     cp -fpv "$here/$pkgname/dist/lib/$dlname" "$PROJECT_ROOT/electrum" || fail "Could not copy the $pkgname binary to its destination"
     info "$dlname has been placed in the inner 'electrum' folder."
+    if [ -n "$DLL_TARGET_DIR" ] ; then
+        cp -fpv "$here/$pkgname/dist/lib/$dlname" "$DLL_TARGET_DIR" || fail "Could not copy the $pkgname binary to DLL_TARGET_DIR"
+    fi
 )

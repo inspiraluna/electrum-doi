@@ -60,6 +60,9 @@ class StoredObject:
     def to_json(self):
         d = dict(vars(self))
         d.pop('db', None)
+        # don't expose/store private stuff
+        d = {k: v for k, v in d.items()
+             if not k.startswith('_')}
         return d
 
 
@@ -100,7 +103,8 @@ class StoredDict(dict):
         elif isinstance(v, dict):
             if self.db:
                 v = self.db._convert_dict(self.path, key, v)
-            v = StoredDict(v, self.db, self.path + [key])
+            if not self.db or self.db._should_convert_to_stored_dict(key):
+                v = StoredDict(v, self.db, self.path + [key])
         # convert_value is called depth-first
         if isinstance(v, dict) or isinstance(v, str):
             if self.db:
@@ -189,5 +193,16 @@ class JsonDB(Logger):
         return False
 
     @locked
-    def dump(self):
-        return json.dumps(self.data, indent=4, sort_keys=True, cls=JsonDBJsonEncoder)
+    def dump(self, *, human_readable: bool = True) -> str:
+        """Serializes the DB as a string.
+        'human_readable': makes the json indented and sorted, but this is ~2x slower
+        """
+        return json.dumps(
+            self.data,
+            indent=4 if human_readable else None,
+            sort_keys=bool(human_readable),
+            cls=JsonDBJsonEncoder,
+        )
+
+    def _should_convert_to_stored_dict(self, key) -> bool:
+        return True

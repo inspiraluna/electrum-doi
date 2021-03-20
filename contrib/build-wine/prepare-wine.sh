@@ -2,30 +2,18 @@
 
 # Please update these carefully, some versions won't work under Wine
 NSIS_FILENAME=nsis-3.05-setup.exe
-NSIS_URL=https://prdownloads.sourceforge.net/nsis/$NSIS_FILENAME?download
+NSIS_URL=https://downloads.sourceforge.net/project/nsis/NSIS%203/3.05/$NSIS_FILENAME
 NSIS_SHA256=1a3cc9401667547b9b9327a177b13485f7c59c2303d4b6183e7bc9e6c8d6bfdb
 
-ZBAR_FILENAME=zbarw-20121031-setup.exe
-ZBAR_URL=https://sourceforge.net/projects/zbarw/files/$ZBAR_FILENAME/download
-ZBAR_SHA256=177e32b272fa76528a3af486b74e9cb356707be1c5ace4ed3fcee9723e2c2c02
-
 LIBUSB_REPO="https://github.com/libusb/libusb.git"
-LIBUSB_COMMIT=e782eeb2514266f6738e242cdcb18e3ae1ed06fa
-# ^ tag v1.0.23
+LIBUSB_COMMIT="c6a35c56016ea2ab2f19115d2ea1e85e0edae155"
+# ^ tag v1.0.24
 
 PYINSTALLER_REPO="https://github.com/SomberNight/pyinstaller.git"
-PYINSTALLER_COMMIT=e934539374e30d1500fcdbe8e4eb0860413935b2
-# ^ tag 3.6, plus a custom commit that fixes cross-compilation with MinGW
+PYINSTALLER_COMMIT="80ee4d613ecf75a1226b960a560ee01459e65ddb"
+# ^ tag 4.2, plus a custom commit that fixes cross-compilation with MinGW
 
-PYTHON_VERSION=3.7.7
-
-## These settings probably don't need change
-export WINEPREFIX=/opt/wine64
-export WINEDEBUG=-all
-
-PYTHON_FOLDER="python3"
-PYHOME="c:/$PYTHON_FOLDER"
-PYTHON="wine $PYHOME/python.exe -OO -B"
+PYTHON_VERSION=3.8.8
 
 
 # Let's begin!
@@ -47,26 +35,28 @@ info "Installing Python."
 # keys from https://www.python.org/downloads/#pubkeys
 KEYRING_PYTHON_DEV="keyring-electrum-build-python-dev.gpg"
 gpg --no-default-keyring --keyring $KEYRING_PYTHON_DEV --import "$here"/gpg_keys/7ED10B6531D7C8E1BC296021FC624643487034E5.asc
+if [ "$WIN_ARCH" = "win32" ] ; then
+    PYARCH="win32"
+elif [ "$WIN_ARCH" = "win64" ] ; then
+    PYARCH="amd64"
+else
+    fail "unexpected WIN_ARCH: $WIN_ARCH"
+fi
 PYTHON_DOWNLOADS="$CACHEDIR/python$PYTHON_VERSION"
 mkdir -p "$PYTHON_DOWNLOADS"
 for msifile in core dev exe lib pip tools; do
     echo "Installing $msifile..."
-    download_if_not_exist "$PYTHON_DOWNLOADS/${msifile}.msi" "https://www.python.org/ftp/python/$PYTHON_VERSION/win32/${msifile}.msi"
-    download_if_not_exist "$PYTHON_DOWNLOADS/${msifile}.msi.asc" "https://www.python.org/ftp/python/$PYTHON_VERSION/win32/${msifile}.msi.asc"
+    download_if_not_exist "$PYTHON_DOWNLOADS/${msifile}.msi" "https://www.python.org/ftp/python/$PYTHON_VERSION/$PYARCH/${msifile}.msi"
+    download_if_not_exist "$PYTHON_DOWNLOADS/${msifile}.msi.asc" "https://www.python.org/ftp/python/$PYTHON_VERSION/$PYARCH/${msifile}.msi.asc"
     verify_signature "$PYTHON_DOWNLOADS/${msifile}.msi.asc" $KEYRING_PYTHON_DEV
-    wine msiexec /i "$PYTHON_DOWNLOADS/${msifile}.msi" /qb TARGETDIR=$PYHOME
+    wine msiexec /i "$PYTHON_DOWNLOADS/${msifile}.msi" /qb TARGETDIR=$WINE_PYHOME
 done
 
+break_legacy_easy_install
+
 info "Installing build dependencies."
-$PYTHON -m pip install --no-dependencies --no-warn-script-location -r "$CONTRIB"/deterministic-build/requirements-wine-build.txt
-
-info "Installing dependencies specific to binaries."
-$PYTHON -m pip install --no-dependencies --no-warn-script-location -r "$CONTRIB"/deterministic-build/requirements-binaries.txt
-
-info "Installing ZBar."
-download_if_not_exist "$CACHEDIR/$ZBAR_FILENAME" "$ZBAR_URL"
-verify_hash "$CACHEDIR/$ZBAR_FILENAME" "$ZBAR_SHA256"
-wine "$CACHEDIR/$ZBAR_FILENAME" /S
+$WINE_PYTHON -m pip install --no-dependencies --no-warn-script-location \
+    --cache-dir "$WINE_PIP_CACHE_DIR" -r "$CONTRIB"/deterministic-build/requirements-build-wine.txt
 
 info "Installing NSIS."
 download_if_not_exist "$CACHEDIR/$NSIS_FILENAME" "$NSIS_URL"
@@ -88,27 +78,39 @@ info "Compiling libusb..."
     git init
     git remote add origin $LIBUSB_REPO
     git fetch --depth 1 origin $LIBUSB_COMMIT
-    git checkout -b pinned FETCH_HEAD
+    git checkout -b pinned "${LIBUSB_COMMIT}^{commit}"
     echo "libusb_1_0_la_LDFLAGS += -Wc,-static" >> libusb/Makefile.am
     ./bootstrap.sh || fail "Could not bootstrap libusb"
-    host="i686-w64-mingw32"
+    host="$GCC_TRIPLET_HOST"
     LDFLAGS="-Wl,--no-insert-timestamp" ./configure \
         --host=$host \
-        --build=x86_64-pc-linux-gnu || fail "Could not run ./configure for libusb"
+        --build=$GCC_TRIPLET_BUILD || fail "Could not run ./configure for libusb"
     make -j4 || fail "Could not build libusb"
     ${host}-strip libusb/.libs/libusb-1.0.dll
 ) || fail "libusb build failed"
 cp "$CACHEDIR/libusb/libusb/.libs/libusb-1.0.dll" $WINEPREFIX/drive_c/tmp/  || fail "Could not copy libusb to its destination"
 
 
-# copy libsecp dll (already built)
-cp "$PROJECT_ROOT/electrum/libsecp256k1-0.dll" $WINEPREFIX/drive_c/tmp/ || fail "Could not copy libsecp to its destination"
+# copy already built DLLs
+cp "$DLL_TARGET_DIR/libsecp256k1-0.dll" $WINEPREFIX/drive_c/tmp/ || fail "Could not copy libsecp to its destination"
+cp "$DLL_TARGET_DIR/libzbar-0.dll" $WINEPREFIX/drive_c/tmp/ || fail "Could not copy libzbar to its destination"
 
 
 info "Building PyInstaller."
 # we build our own PyInstaller boot loader as the default one has high
 # anti-virus false positives
 (
+    if [ "$WIN_ARCH" = "win32" ] ; then
+        PYINST_ARCH="32bit"
+    elif [ "$WIN_ARCH" = "win64" ] ; then
+        PYINST_ARCH="64bit"
+    else
+        fail "unexpected WIN_ARCH: $WIN_ARCH"
+    fi
+    if [ -f "$CACHEDIR/pyinstaller/PyInstaller/bootloader/Windows-$PYINST_ARCH/runw.exe" ]; then
+        info "pyinstaller already built, skipping"
+        exit 0
+    fi
     cd "$WINEPREFIX/drive_c/electrum"
     ELECTRUM_COMMIT_HASH=$(git rev-parse HEAD)
     cd "$CACHEDIR"
@@ -119,19 +121,25 @@ info "Building PyInstaller."
     git init
     git remote add origin $PYINSTALLER_REPO
     git fetch --depth 1 origin $PYINSTALLER_COMMIT
-    git checkout -b pinned FETCH_HEAD
+    git checkout -b pinned "${PYINSTALLER_COMMIT}^{commit}"
     rm -fv PyInstaller/bootloader/Windows-*/run*.exe || true
     # add reproducible randomness. this ensures we build a different bootloader for each commit.
     # if we built the same one for all releases, that might also get anti-virus false positives
     echo "const char *electrum_tag = \"tagged by Electrum@$ELECTRUM_COMMIT_HASH\";" >> ./bootloader/src/pyi_main.c
     pushd bootloader
     # cross-compile to Windows using host python
-    python3 ./waf all CC=i686-w64-mingw32-gcc CFLAGS="-static -Wno-dangling-else -Wno-error=unused-value"
+    python3 ./waf all CC="${GCC_TRIPLET_HOST}-gcc" \
+                      CFLAGS="-static \
+                              -Wno-dangling-else \
+                              -Wno-error=unused-value \
+                              -Wno-error=implicit-function-declaration \
+                              -Wno-error=int-to-pointer-cast \
+                              -Wno-error=stringop-truncation"
     popd
     # sanity check bootloader is there:
-    [[ -e PyInstaller/bootloader/Windows-32bit/runw.exe ]] || fail "Could not find runw.exe in target dir!"
+    [[ -e "PyInstaller/bootloader/Windows-$PYINST_ARCH/runw.exe" ]] || fail "Could not find runw.exe in target dir!"
 ) || fail "PyInstaller build failed"
 info "Installing PyInstaller."
-$PYTHON -m pip install --no-dependencies --no-warn-script-location ./pyinstaller
+$WINE_PYTHON -m pip install --no-dependencies --no-warn-script-location ./pyinstaller
 
 info "Wine is configured."

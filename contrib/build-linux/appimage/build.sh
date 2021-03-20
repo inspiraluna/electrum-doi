@@ -9,11 +9,14 @@ DISTDIR="$PROJECT_ROOT/dist"
 BUILDDIR="$CONTRIB_APPIMAGE/build/appimage"
 APPDIR="$BUILDDIR/electrum.AppDir"
 CACHEDIR="$CONTRIB_APPIMAGE/.cache/appimage"
+PIP_CACHE_DIR="$CACHEDIR/pip_cache"
 
 export GCC_STRIP_BINARIES="1"
 
 # pinned versions
-PYTHON_VERSION=3.7.7
+# note: compiling python 3.8.x requires at least glibc 2.27,
+#       which is first available on ubuntu 18.04
+PYTHON_VERSION=3.7.10
 PKG2APPIMAGE_COMMIT="eb8f3acdd9f11ab19b78f5cb15daa772367daf15"
 SQUASHFSKIT_COMMIT="ae0d656efa2d0df2fcac795b6823b44462f19386"
 
@@ -24,7 +27,7 @@ APPIMAGE="$DISTDIR/electrum-$VERSION-x86_64.AppImage"
 . "$CONTRIB"/build_tools_util.sh
 
 rm -rf "$BUILDDIR"
-mkdir -p "$APPDIR" "$CACHEDIR" "$DISTDIR"
+mkdir -p "$APPDIR" "$CACHEDIR" "$PIP_CACHE_DIR" "$DISTDIR"
 
 # potential leftover from setuptools that might make pip put garbage in binary
 rm -rf "$PROJECT_ROOT/build"
@@ -38,7 +41,7 @@ download_if_not_exist "$CACHEDIR/appimagetool" "https://github.com/AppImage/AppI
 verify_hash "$CACHEDIR/appimagetool" "d918b4df547b388ef253f3c9e7f6529ca81a885395c31f619d9aaf7030499a13"
 
 download_if_not_exist "$CACHEDIR/Python-$PYTHON_VERSION.tar.xz" "https://www.python.org/ftp/python/$PYTHON_VERSION/Python-$PYTHON_VERSION.tar.xz"
-verify_hash "$CACHEDIR/Python-$PYTHON_VERSION.tar.xz" "06a0a9f1bf0d8cd1e4121194d666c4e28ddae4dd54346de6c343206599f02136"
+verify_hash "$CACHEDIR/Python-$PYTHON_VERSION.tar.xz" "f8d82e7572c86ec9d55c8627aae5040124fd2203af400c383c821b980306ee6b"
 
 
 
@@ -71,7 +74,7 @@ info "Building squashfskit"
 git clone "https://github.com/squashfskit/squashfskit.git" "$BUILDDIR/squashfskit"
 (
     cd "$BUILDDIR/squashfskit"
-    git checkout "$SQUASHFSKIT_COMMIT"
+    git checkout "${SQUASHFSKIT_COMMIT}^{commit}"
     make -C squashfs-tools mksquashfs || fail "Could not build squashfskit"
 )
 MKSQUASHFS="$BUILDDIR/squashfskit/squashfs-tools/mksquashfs"
@@ -94,6 +97,8 @@ python='appdir_python'
 info "installing pip."
 "$python" -m ensurepip
 
+break_legacy_easy_install
+
 
 info "preparing electrum-locale."
 (
@@ -113,12 +118,24 @@ info "preparing electrum-locale."
 )
 
 
+info "Installing build dependencies."
+"$python" -m pip install --no-dependencies --no-binary :all: --no-warn-script-location \
+    --cache-dir "$PIP_CACHE_DIR" -r "$CONTRIB/deterministic-build/requirements-build-appimage.txt"
+
 info "installing electrum and its dependencies."
-mkdir -p "$CACHEDIR/pip_cache"
-"$python" -m pip install --no-dependencies --no-warn-script-location --cache-dir "$CACHEDIR/pip_cache" -r "$CONTRIB/deterministic-build/requirements.txt"
-"$python" -m pip install --no-dependencies --no-warn-script-location --cache-dir "$CACHEDIR/pip_cache" -r "$CONTRIB/deterministic-build/requirements-binaries.txt"
-"$python" -m pip install --no-dependencies --no-warn-script-location --cache-dir "$CACHEDIR/pip_cache" -r "$CONTRIB/deterministic-build/requirements-hw.txt"
-"$python" -m pip install --no-dependencies --no-warn-script-location --cache-dir "$CACHEDIR/pip_cache" "$PROJECT_ROOT"
+# note: we prefer compiling C extensions ourselves, instead of using binary wheels,
+#       hence "--no-binary :all:" flags. However, we specifically allow
+#       - PyQt5, as it's harder to build from source
+#       - cryptography, as building it would need openssl 1.1, not available on ubuntu 16.04
+"$python" -m pip install --no-dependencies --no-binary :all: --no-warn-script-location \
+    --cache-dir "$PIP_CACHE_DIR" -r "$CONTRIB/deterministic-build/requirements.txt"
+"$python" -m pip install --no-dependencies --no-binary :all: --only-binary PyQt5,PyQt5-Qt5,cryptography --no-warn-script-location \
+    --cache-dir "$PIP_CACHE_DIR" -r "$CONTRIB/deterministic-build/requirements-binaries.txt"
+"$python" -m pip install --no-dependencies --no-binary :all: --no-warn-script-location \
+    --cache-dir "$PIP_CACHE_DIR" -r "$CONTRIB/deterministic-build/requirements-hw.txt"
+
+"$python" -m pip install --no-dependencies --no-warn-script-location \
+    --cache-dir "$PIP_CACHE_DIR" "$PROJECT_ROOT"
 
 # was only needed during build time, not runtime
 "$python" -m pip uninstall -y Cython
@@ -191,28 +208,27 @@ rm -rf "$PYDIR"/config-3.7m-x86_64-linux-gnu
 rm -rf "$PYDIR"/site-packages/{opt,pip,setuptools,wheel}
 rm -rf "$PYDIR"/site-packages/Cryptodome/SelfTest
 rm -rf "$PYDIR"/site-packages/{psutil,qrcode,websocket}/tests
+# rm lots of unused parts of Qt/PyQt. (assuming PyQt 5.15.3+ layout)
 for component in connectivity declarative help location multimedia quickcontrols2 serialport webengine websockets xmlpatterns ; do
-  rm -rf "$PYDIR"/site-packages/PyQt5/Qt/translations/qt${component}_*
-  rm -rf "$PYDIR"/site-packages/PyQt5/Qt/resources/qt${component}_*
+  rm -rf "$PYDIR"/site-packages/PyQt5/Qt5/translations/qt${component}_*
+  rm -rf "$PYDIR"/site-packages/PyQt5/Qt5/resources/qt${component}_*
 done
-rm -rf "$PYDIR"/site-packages/PyQt5/Qt/{qml,libexec}
-rm -rf "$PYDIR"/site-packages/PyQt5/{pyrcc.so,pylupdate.so,uic}
-rm -rf "$PYDIR"/site-packages/PyQt5/Qt/plugins/{bearer,gamepads,geometryloaders,geoservices,playlistformats,position,renderplugins,sceneparsers,sensors,sqldrivers,texttospeech,webview}
+rm -rf "$PYDIR"/site-packages/PyQt5/Qt5/{qml,libexec}
+rm -rf "$PYDIR"/site-packages/PyQt5/{pyrcc*.so,pylupdate*.so,uic}
+rm -rf "$PYDIR"/site-packages/PyQt5/Qt5/plugins/{bearer,gamepads,geometryloaders,geoservices,playlistformats,position,renderplugins,sceneparsers,sensors,sqldrivers,texttospeech,webview}
 for component in Bluetooth Concurrent Designer Help Location NetworkAuth Nfc Positioning PositioningQuick Qml Quick Sensors SerialPort Sql Test Web Xml ; do
-    rm -rf "$PYDIR"/site-packages/PyQt5/Qt/lib/libQt5${component}*
+    rm -rf "$PYDIR"/site-packages/PyQt5/Qt5/lib/libQt5${component}*
     rm -rf "$PYDIR"/site-packages/PyQt5/Qt${component}*
 done
 rm -rf "$PYDIR"/site-packages/PyQt5/Qt.so
 
 # these are deleted as they were not deterministic; and are not needed anyway
 find "$APPDIR" -path '*/__pycache__*' -delete
-# note that jsonschema-*.dist-info is needed by that package as it uses 'pkg_resources.get_distribution'
-# also, see https://gitlab.com/python-devs/importlib_metadata/issues/71
-for f in "$PYDIR"/site-packages/jsonschema-*.dist-info; do mv "$f" "$(echo "$f" | sed s/\.dist-info/\.dist-info2/)"; done
+# note that *.dist-info is needed by certain packages.
+# e.g. see https://gitlab.com/python-devs/importlib_metadata/issues/71
 for f in "$PYDIR"/site-packages/importlib_metadata-*.dist-info; do mv "$f" "$(echo "$f" | sed s/\.dist-info/\.dist-info2/)"; done
 rm -rf "$PYDIR"/site-packages/*.dist-info/
 rm -rf "$PYDIR"/site-packages/*.egg-info/
-for f in "$PYDIR"/site-packages/jsonschema-*.dist-info2; do mv "$f" "$(echo "$f" | sed s/\.dist-info2/\.dist-info/)"; done
 for f in "$PYDIR"/site-packages/importlib_metadata-*.dist-info2; do mv "$f" "$(echo "$f" | sed s/\.dist-info2/\.dist-info/)"; done
 
 

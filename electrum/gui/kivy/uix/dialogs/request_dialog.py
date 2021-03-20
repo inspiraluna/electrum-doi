@@ -15,9 +15,11 @@ if TYPE_CHECKING:
 
 
 Builder.load_string('''
+#:import KIVY_GUI_PATH electrum.gui.kivy.KIVY_GUI_PATH
+
 <RequestDialog@Popup>
     id: popup
-    amount: 0
+    amount_str: ''
     title: ''
     description:''
     is_lightning: False
@@ -44,11 +46,12 @@ Builder.load_string('''
             TopLabel:
                 text: _('Description') + ': ' + root.description or _('None')
             TopLabel:
-                text: _('Amount') + ': ' + app.format_amount_and_units(root.amount)
+                text: _('Amount') + ': ' + root.amount_str
             TopLabel:
                 text: (_('Address') if not root.is_lightning else _('Payment hash')) + ': '
             RefLabel:
-                text: root.key
+                data: root.key
+                name: (_('Address') if not root.is_lightning else _('Payment hash'))
             TopLabel:
                 text: _('Status') + ': ' + root.status_str
                 color: root.status_color
@@ -66,12 +69,12 @@ Builder.load_string('''
                     text: _('Delete')
                     on_release: root.delete_dialog()
                 IconButton:
-                    icon: 'atlas://electrum/gui/kivy/theming/light/copy'
+                    icon: f'atlas://{KIVY_GUI_PATH}/theming/light/copy'
                     size_hint: 0.5, None
                     height: '48dp'
                     on_release: root.copy_to_clipboard()
                 IconButton:
-                    icon: 'atlas://electrum/gui/kivy/theming/light/share'
+                    icon: f'atlas://{KIVY_GUI_PATH}/theming/light/share'
                     size_hint: 0.5, None
                     height: '48dp'
                     on_release: root.do_share()
@@ -93,7 +96,8 @@ class RequestDialog(Factory.Popup):
         r = self.app.wallet.get_request(key)
         self.is_lightning = r.is_lightning()
         self.data = r.invoice if self.is_lightning else self.app.wallet.get_request_URI(r)
-        self.amount = r.amount or 0
+        self.amount_sat = r.get_amount_sat()
+        self.amount_str = self.app.format_amount_and_units(self.amount_sat)
         self.description = r.message
         self.update_status()
 
@@ -111,8 +115,12 @@ class RequestDialog(Factory.Popup):
         self.status_str = req.get_status_str(self.status)
         self.status_color = pr_color[self.status]
         if self.status == PR_UNPAID and self.is_lightning and self.app.wallet.lnworker:
-            if self.amount and self.amount > self.app.wallet.lnworker.num_sats_can_receive():
+            if self.amount_sat and self.amount_sat > self.app.wallet.lnworker.num_sats_can_receive():
                 self.warning = _('Warning') + ': ' + _('This amount exceeds the maximum you can currently receive with your channels')
+        if self.status == PR_UNPAID and not self.is_lightning:
+            address = req.get_address()
+            if self.app.wallet.is_used(address):
+                self.warning = _('Warning') + ': ' + _('This address is being reused')
 
     def on_dismiss(self):
         self.app.request_popup = None
